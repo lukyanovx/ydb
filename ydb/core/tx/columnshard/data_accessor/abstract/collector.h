@@ -9,12 +9,18 @@ public:
     virtual ~IAccessorCallback() = default;
 };
 
-class TActorAccessorsCallback: public IAccessorCallback {
+class Foo {
+public:
+    virtual void OnAccessorsFetched(std::vector<TPortionDataAccessor>&& accessors, const TActorId& owner) = 0;
+    virtual ~Foo() = default;
+};
+
+class TActorAccessorsCallback: public Foo {
 private:
     const NActors::TActorId ActorId;
 
 public:
-    virtual void OnAccessorsFetched(std::vector<TPortionDataAccessor>&& accessors) override;
+    virtual void OnAccessorsFetched(std::vector<TPortionDataAccessor>&& accessors, const TActorId& owner) override;
     TActorAccessorsCallback(const NActors::TActorId& actorId)
         : ActorId(actorId) {
     }
@@ -83,6 +89,7 @@ private:
     virtual void DoAskData(THashMap<TInternalPathId, TPortionsByConsumer>&& portions, const std::shared_ptr<IAccessorCallback>& callback) = 0;
     virtual TDataCategorized DoAnalyzeData(const TPortionsByConsumer& portions) = 0;
     virtual void DoModifyPortions(const std::vector<TPortionDataAccessor>& add, const std::vector<ui64>& remove) = 0;
+    virtual void DoResize(ui64 size) = 0;
 
 public:
     virtual ~IGranuleDataAccessor() = default;
@@ -99,6 +106,9 @@ public:
     TDataCategorized AnalyzeData(const TPortionsByConsumer& portions);
     void ModifyPortions(const std::vector<TPortionDataAccessor>& add, const std::vector<ui64>& remove) {
         return DoModifyPortions(add, remove);
+    }
+    void Resize(ui64 size) {
+      DoResize(size);
     }
 };
 

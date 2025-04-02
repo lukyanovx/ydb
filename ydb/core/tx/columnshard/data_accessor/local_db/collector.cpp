@@ -37,4 +37,8 @@ void TCollector::DoModifyPortions(const std::vector<TPortionDataAccessor>& add, 
     }
 }
 
+void TCollector::DoResize(ui64 size) {
+    AccessorsCache.SetMaxSize(size);
+}
+
 }   // namespace NKikimr::NOlap::NDataAccessorControl::NLocalDB
