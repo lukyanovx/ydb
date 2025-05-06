@@ -89,16 +89,10 @@ jobs:
             git checkout -b ${PR_BRANCH}
           fi
       
-          # Attempt to rebase PR branch onto BASE_BRANCH
-          if ! git rebase origin/${{ env.BASE_BRANCH }} -X theirs; then
-            echo "Rebase failed, resetting branch to match ${{ env.BASE_BRANCH }}..."
-            # Abort the rebase process
-            git rebase --abort
-            echo "Reset branch ${PR_BRANCH} to origin/${{ env.BASE_BRANCH }}"
-            git reset --hard origin/${{ env.BASE_BRANCH }}
-          fi
-          
-          git push origin ${PR_BRANCH} --force
+          # set PR_BRANCH to  BASE_BRANCH state
+          git reset --soft origin/${{ env.BASE_BRANCH }}
+          git commit -m "Reset branch to match origin/${{ env.BASE_BRANCH }}"
+          git push origin ${PR_BRANCH}
         
       - name: Run create_new_muted_ya.py
         run: |
