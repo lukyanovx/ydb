@@ -70,7 +70,6 @@ jobs:
 
       - name: Update branch for PR
         run: |
-          # Устанавливаем имя ветки PR без суффикса build_type
           PR_BRANCH="${{ env.BRANCH_FOR_PR }}_${{ env.BASE_BRANCH }}"
           echo "PR_BRANCH=${PR_BRANCH}" >> $GITHUB_ENV
           
@@ -78,21 +77,22 @@ jobs:
           git config user.email ydbot@ydb.tech
       
           # Fetch the latest changes from remote
-          git fetch origin ${PR_BRANCH} || true
-          git pull origin ${PR_BRANCH} || true
-      
-          # Checkout BRANCH_FOR_PR, create if it doesn't exist based on BASE_BRANCH
+          git fetch origin  || true
+
+          # Checkout PR_BRANCH, create if it doesn't exist based on BASE_BRANCH
           if git show-ref --quiet refs/remotes/origin/${PR_BRANCH}; then
             echo "Branch ${PR_BRANCH} exists."
-            git checkout ${PR_BRANCH}
+            # Создаем локальную ветку, которая отслеживает удаленную
+            git checkout -B ${PR_BRANCH} origin/${PR_BRANCH}
+            
+            # Используем merge с опцией ours, чтобы игнорировать содержимое PR_BRANCH
+            git merge -s ours origin/${{ env.BASE_BRANCH }} -m "Reset branch to match origin/${{ env.BASE_BRANCH }}"
           else
             echo "Branch ${PR_BRANCH} does not exist. Creating based on ${{ env.BASE_BRANCH }}"
-            git checkout -b ${PR_BRANCH}
+            git checkout -b ${PR_BRANCH} origin/${{ env.BASE_BRANCH }}
+            git commit --allow-empty -m "Initialize branch"
           fi
-      
-          # set PR_BRANCH to  BASE_BRANCH state
-          git reset --soft origin/${{ env.BASE_BRANCH }}
-          git commit -m "Reset branch to match origin/${{ env.BASE_BRANCH }}"
+
           git push origin ${PR_BRANCH}
         
       - name: Run create_new_muted_ya.py
