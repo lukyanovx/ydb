@@ -76,24 +76,48 @@ jobs:
           git config user.name YDBot
           git config user.email ydbot@ydb.tech
       
-          # Fetch the latest changes from remote
-          git fetch origin  || true
+          # Fetch the history of both branches
+          git fetch origin ${PR_BRANCH} --depth=1000 || true
+          git fetch origin ${{ env.BASE_BRANCH }} --depth=1000 || true
 
-          # Checkout PR_BRANCH, create if it doesn't exist based on BASE_BRANCH
+          # Checkout PR_BRANCH, create if it doesn't exist
           if git show-ref --quiet refs/remotes/origin/${PR_BRANCH}; then
             echo "Branch ${PR_BRANCH} exists."
-            # Создаем локальную ветку, которая отслеживает удаленную
             git checkout -B ${PR_BRANCH} origin/${PR_BRANCH}
-            
-            # Используем merge с опцией ours, чтобы игнорировать содержимое PR_BRANCH
-            git merge -s ours origin/${{ env.BASE_BRANCH }} -m "Reset branch to match origin/${{ env.BASE_BRANCH }}"
           else
             echo "Branch ${PR_BRANCH} does not exist. Creating based on ${{ env.BASE_BRANCH }}"
             git checkout -b ${PR_BRANCH} origin/${{ env.BASE_BRANCH }}
-            git commit --allow-empty -m "Initialize branch"
           fi
 
-          git push origin ${PR_BRANCH}
+          # Try merge approach first (should work if histories are related)
+          if git merge -s ours origin/${{ env.BASE_BRANCH }} -m "Reset branch to match origin/${{ env.BASE_BRANCH }}"; then
+            echo "✅ Successfully merged using 'ours' strategy"
+          else
+            echo "🟡 Merge failed, using reset approach instead..."
+            git merge --abort || true
+            git reset --hard origin/${{ env.BASE_BRANCH }}
+          fi
+
+          # Push the changes with detailed logging
+          echo "Attempting normal push first..."
+          if git push origin ${PR_BRANCH}; then
+            echo "✅ Normal push succeeded! Branch updated without force."
+          else
+            echo "🟡 Normal push failed. Attempting force push..."
+            if git push --force origin ${PR_BRANCH}; then
+              echo "✅ Force push succeeded! Branch updated."
+            else
+              echo "❌ Both normal and force push failed. Something is wrong with the repository or permissions."
+              echo "Current branch state:"
+              git status
+              echo "Recent commits:"
+              git log -n 5 --oneline
+              exit 1
+            fi
+          fi
+
+          echo "Branch ${PR_BRANCH} has been successfully updated to match ${{ env.BASE_BRANCH }}"
+
         
       - name: Run create_new_muted_ya.py
         run: |
