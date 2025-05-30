@@ -51,25 +51,36 @@ jobs:
           LABEL_ACTION="Adding"
         fi
         
-        # Function to fetch a page of runners
+        # Function to fetch a page of runners - NO OUTPUT ALLOWED HERE
         fetch_runners_page() {
           local page=$1
-          local result
+          local temp_file=$(mktemp)
+          local result_file=$(mktemp)
           
-          result=$(curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{secrets.GH_PERSONAL_ACCESS_TOKEN}}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" -w "\n%{http_code}" \
-            "https://api.github.com/repos/${{github.repository}}/actions/runners?per_page=100&page=$page")
+          # Redirect any output to temp file so it doesn't mix with JSON
+          {
+            curl -s -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{secrets.GH_PERSONAL_ACCESS_TOKEN}}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" -w "\n%{http_code}" \
+              "https://api.github.com/repos/${{github.repository}}/actions/runners?per_page=100&page=$page"
+          } > "$temp_file" 2>/dev/null
           
-          local http_code=$(echo "$result" | tail -n 1)
+          # Get the HTTP code from the last line
+          local http_code=$(tail -n1 "$temp_file")
+          
+          # Check for success
           if [ "$http_code" != "200" ]; then
-            echo "HTTP error fetching page $page: $http_code"
-            echo "$result" | head -n -1
+            echo "ERROR: HTTP $http_code" > "$result_file"
+            head -n -1 "$temp_file" >> "$result_file"
+            cat "$result_file"
+            rm -f "$temp_file" "$result_file"
             return 1
           fi
-          echo "Fetched runners page $page successfully"
           
-          # Remove status code from the end
-          echo "$result" | head -n -1
+          # Only keep the JSON part (without the status code line)
+          head -n -1 "$temp_file" > "$result_file"
+          cat "$result_file"
+          rm -f "$temp_file" "$result_file"
+          return 0
         }
         
         # Get all runners with pagination
@@ -86,10 +97,17 @@ jobs:
             exit 1
           fi
           
+          echo "Successfully received page $page"
+          
+          # Write data to a temp file for processing to avoid any issues with pipes
+          temp_json_file=$(mktemp)
+          echo "$runners_data" > "$temp_json_file"
+          
           # Verify JSON is valid before processing
-          if ! echo "$runners_data" | jq . >/dev/null 2>&1; then
+          if ! jq . "$temp_json_file" >/dev/null 2>&1; then
             echo "Invalid JSON received from API. Raw response:"
-            echo "$runners_data"
+            cat "$temp_json_file"
+            rm -f "$temp_json_file"
             exit 1
           fi
           
@@ -99,7 +117,10 @@ jobs:
             if [[ -n "$id" && "$id" != "null" ]]; then
               page_ids+=("$id")
             fi
-          done < <(echo "$runners_data" | jq -r "$query" 2>/dev/null || echo "")
+          done < <(jq -r "$query" "$temp_json_file" 2>/dev/null || echo "")
+          
+          # Clean up temp file
+          rm -f "$temp_json_file"
           
           # Check if we have runners on this page
           count_on_page=${#page_ids[@]}
@@ -108,8 +129,12 @@ jobs:
           # Append to our array
           all_runner_ids+=("${page_ids[@]}")
           
-          # Check if we have more pages
-          runners_count=$(echo "$runners_data" | jq '.runners | length' 2>/dev/null || echo "0")
+          # Check if we have more pages - create another temp file to avoid any issues
+          temp_count_file=$(mktemp)
+          jq '.runners | length' <<< "$runners_data" 2>/dev/null > "$temp_count_file" || echo "0" > "$temp_count_file" 
+          runners_count=$(<"$temp_count_file")
+          rm -f "$temp_count_file"
+          
           if [[ -z "$runners_count" || "$runners_count" == "null" || $runners_count -lt 100 ]]; then
             more_pages=false
           else
@@ -151,35 +176,41 @@ jobs:
             continue
           fi
           
+          # Use temp files to avoid output issues
+          response_file=$(mktemp)
+          
           if [[ "${{ github.event.inputs.action }}" == "close" ]]; then
             echo "Removing postcommit label from runner $runner_id"
-            response=$(curl -s -w "\n%{http_code}" -X DELETE -H "Accept: application/vnd.github+json" \
+            curl -s -w "\n%{http_code}" -X DELETE -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${{secrets.GH_PERSONAL_ACCESS_TOKEN}}" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${{github.repository}}/actions/runners/$runner_id/labels/postcommit")
+              "https://api.github.com/repos/${{github.repository}}/actions/runners/$runner_id/labels/postcommit" > "$response_file"
           else
             echo "Adding postcommit label to runner $runner_id"
-            response=$(curl -s -w "\n%{http_code}" -X POST -H "Accept: application/vnd.github+json" \
+            curl -s -w "\n%{http_code}" -X POST -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer ${{secrets.GH_PERSONAL_ACCESS_TOKEN}}" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/repos/${{github.repository}}/actions/runners/$runner_id/labels" \
-              -d '{"labels":["postcommit"]}')
+              -d '{"labels":["postcommit"]}' > "$response_file"
           fi
           
           # Parse response
-          http_code=$(echo "$response" | tail -n1)
-          body=$(echo "$response" | head -n -1)
+          http_code=$(tail -n1 "$response_file")
+          body=$(head -n -1 "$response_file")
+          rm -f "$response_file"
           
           # Get runner name for better reporting - do this silently
-          runner_info=$(curl -s -H "Accept: application/vnd.github+json" \
+          runner_info_file=$(mktemp)
+          curl -s -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${{secrets.GH_PERSONAL_ACCESS_TOKEN}}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${{github.repository}}/actions/runners/$runner_id")
+            "https://api.github.com/repos/${{github.repository}}/actions/runners/$runner_id" > "$runner_info_file"
           
           runner_name="Unknown"
-          if echo "$runner_info" | jq . >/dev/null 2>&1; then
-            runner_name=$(echo "$runner_info" | jq -r '.name // "Unknown"')
+          if jq . "$runner_info_file" >/dev/null 2>&1; then
+            runner_name=$(jq -r '.name // "Unknown"' "$runner_info_file")
           fi
+          rm -f "$runner_info_file"
           
           # Check success (HTTP 2xx)
           if [[ $http_code =~ ^2[0-9][0-9]$ ]]; then
