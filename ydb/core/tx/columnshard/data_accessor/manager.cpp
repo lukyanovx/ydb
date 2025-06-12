@@ -156,14 +156,14 @@ void TLocalManager::DoAskData(const std::shared_ptr<TDataAccessorsRequest>& requ
         auto it = Managers.find(owner);
         if (it == Managers.end()) {
             AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "owner_not_found")("owner", owner);
-            request->AddError(pathId, "Owner not found");
+            // request->AddError(pathId, "Owner not found");
             continue;
         }
 
         auto iit = it->second.find(pathId);
         if (iit == it->second.end()) {
             AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "table_not_found")("pathId", pathId);
-            request->AddError(pathId, "Table not found");
+            // request->AddError(pathId, "Table not found");
             continue;
         }
 
