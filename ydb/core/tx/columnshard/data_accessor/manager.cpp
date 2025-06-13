@@ -7,9 +7,6 @@
 namespace NKikimr::NOlap::NDataAccessorControl {
 
 void TLocalManager::DrainQueue() {
-    std::optional<TActorId> lastOwner;
-    std::optional<TInternalPathId> lastTable;
-    std::shared_ptr<IGranuleDataAccessor> lastDataAccessor = nullptr;
     TPositiveControlInteger countToFlight;
 
     const auto maxPortionsMetadataAsk = NYDBTest::TControllers::GetColumnShardController()->GetLimitForPortionsMetadataAsk();
@@ -17,50 +14,35 @@ void TLocalManager::DrainQueue() {
         THashMap<TActorId, THashMap<TInternalPathId, TPortionsByConsumer>> portionsToAsk;
 
         while (PortionsAskInFlight + countToFlight < 1000 && !PortionsAsk.empty()) {
-            auto [owner, tableId, portionToAsk] = PortionsAsk.front();
+            auto& portionToAsk = PortionsAsk.front();
             auto p = portionToAsk.ExtractPortion();
-            const TString consumerId = portionToAsk.GetConsumerId();
+            auto consumerId = portionToAsk.GetConsumerId();
+            auto& owner = portionToAsk.GetOwner();
             PortionsAsk.pop_front();
 
-            // Check if we need to update our cached accessor
-            if (!lastOwner || *lastOwner != owner || !lastTable || *lastTable != tableId) {
-                lastOwner = owner;
-                lastTable = tableId;
-                lastDataAccessor = nullptr; // Reset cached accessor
-
-                auto it = Managers.find(owner);
-                if (it != Managers.end()) {
-                    auto iit = it->second.find(tableId);
-                    if (iit != it->second.end()) {
-                        lastDataAccessor = iit->second;
-                    }
-                }
-            }
-
-            auto it = RequestsByPortion.find(owner);
-            if (it == RequestsByPortion.end()) {
+            auto ownerInfo = PortionOwners.find(owner);
+            if (ownerInfo == PortionOwners.end()) {
+                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "drain_queue")("can't find owner, ignoring", owner);
                 continue;
             }
 
-            auto iit = it->second.find(std::pair{tableId, p->GetPortionId()});
-            if (iit == it->second.end()) {
+            auto it = ownerInfo->second.RequestsByPortion.find(std::pair{p->GetPathId(), p->GetPortionId()});
+            if (it == ownerInfo->second.RequestsByPortion.end()) {
+                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "drain_queue")("owner hasn't requested portion", owner)("table", p->GetPathId())("portion", p->GetPortionId());
                 continue;
             }
 
-            if (!lastDataAccessor) {
-                // No accessor available, mark all requests as failed
-                for (auto&& i : iit->second) {
+            if (!ownerInfo->second.DataAccessors.contains(p->GetPathId())) {
+                AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "drain_queue")("owner has no accessor to table", owner)("table", p->GetPathId());
+                for (auto&& i : it->second) {
                     if (!i->IsFetched() && !i->IsAborted()) {
                         i->AddError(p->GetPathId(), "path id absent");
                     }
                 }
-                it->second.erase(iit);
-                if (it->second.empty()) {
-                    RequestsByPortion.erase(it);
-                }
+                ownerInfo->second.RequestsByPortion.erase(it);
             } else {
                 bool toAsk = false;
-                for (auto&& i : iit->second) {
+                for (auto&& i : it->second) {
                     if (!i->IsFetched() && !i->IsAborted()) {
                         toAsk = true;
                         break;
@@ -68,54 +50,37 @@ void TLocalManager::DrainQueue() {
                 }
 
                 if (!toAsk) {
-                    it->second.erase(iit);
-                    if (it->second.empty()) {
-                        RequestsByPortion.erase(it);
-                    }
+                    ownerInfo->second.RequestsByPortion.erase(it);
                 } else {
-                    portionsToAsk[owner][tableId].UpsertConsumer(consumerId).AddPortion(p);
+                    portionsToAsk[owner][p->GetPathId()].UpsertConsumer(consumerId).AddPortion(p);
                     ++countToFlight;
                 }
             }
         }
 
         for (auto& [owner, portionsByTable] : portionsToAsk) {
+            const auto& ownerInfo = PortionOwners.find(owner);
+            AFL_VERIFY(ownerInfo != PortionOwners.end());
+
             for (auto& [tableId, portions] : portionsByTable) {
-                auto managerIt = Managers.find(owner);
-                if (managerIt == Managers.end()) {
-                    continue; // Skip if owner not found
-                }
 
-                auto tableIt = managerIt->second.find(tableId);
-                if (tableIt == managerIt->second.end()) {
-                    continue; // Skip if table not found
-                }
+                auto dataAccessor = ownerInfo->second.DataAccessors.find(tableId);
+                AFL_VERIFY(dataAccessor != ownerInfo->second.DataAccessors.end());
 
-                auto& manager = tableIt->second;
-                auto dataAnalyzed = manager->AnalyzeData(portions);
+                auto dataAnalyzed = dataAccessor->second->AnalyzeData(portions);
 
                 for (auto&& accessor : dataAnalyzed.GetCachedAccessors()) {
-                    auto it = RequestsByPortion.find(owner);
-                    if (it == RequestsByPortion.end()) {
-                        continue;
-                    }
+                    auto it = ownerInfo->second.RequestsByPortion.find(std::pair{tableId, accessor.GetPortionInfo().GetPortionId()});
+                    AFL_VERIFY(it != ownerInfo->second.RequestsByPortion.end());
 
-                    auto iit = it->second.find(std::pair{tableId, accessor.GetPortionInfo().GetPortionId()});
-                    if (iit == it->second.end()) {
-                        continue;
-                    }
-
-                    for (auto&& i : iit->second) {
+                    for (auto&& i : it->second) {
                         Counters.ResultFromCache->Add(1);
                         if (!i->IsFetched() && !i->IsAborted()) {
                             i->AddAccessor(accessor);
                         }
                     }
 
-                    it->second.erase(iit);
-                    if (it->second.empty()) {
-                        RequestsByPortion.erase(it);
-                    }
+                    ownerInfo->second.RequestsByPortion.erase(it);
                     --countToFlight;
                 }
 
@@ -123,7 +88,7 @@ void TLocalManager::DrainQueue() {
                     THashMap<TInternalPathId, TPortionsByConsumer> portionsToAskImpl;
                     Counters.ResultAskDirectly->Add(dataAnalyzed.GetPortionsToAsk().GetPortionsCount());
                     portionsToAskImpl.emplace(tableId, dataAnalyzed.DetachPortionsToAsk());
-                    manager->AskData(std::move(portionsToAskImpl), std::make_shared<TCallbackWrapper>(AccessorCallback, owner));
+                    dataAccessor->second->AskData(std::move(portionsToAskImpl), ownerInfo->second.AccessorCallback);
                 }
             }
         }
@@ -135,48 +100,47 @@ void TLocalManager::DrainQueue() {
 }
 
 void TLocalManager::ResizeCache() {
-    if (Managers.empty()) {
-        return; // Nothing to resize
+    auto amount = 0;
+    for (auto& [_, ownerInfo] : PortionOwners) {
+        amount += ownerInfo.DataAccessors.size();
     }
 
-    auto size = TotalMemorySize / Managers.size();
-    for (auto& [_, managerMap] : Managers) {
-        for (auto& [__, manager] : managerMap) {
-            if (manager) {
-                manager->Resize(size);
+    if (amount <= 0) {
+        return;
+    }
+
+    auto size = TotalMemorySize / amount;
+    for (auto& [_, ownerInfo] : PortionOwners) {
+        for (auto& [__, dataAccessor] : ownerInfo.DataAccessors) {
+            if (dataAccessor) {
+                dataAccessor->Resize(size);
             }
         }
     }
 }
 
 void TLocalManager::DoAskData(const std::shared_ptr<TDataAccessorsRequest>& request, const TActorId& owner) {
-    AFL_INFO(NKikimrServices::TX_COLUMNSHARD)("event", "ask_data")("request", request->DebugString());
+    auto ownerInfo = PortionOwners.find(owner);
+    if (ownerInfo == PortionOwners.end()) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "owner_not_found")("owner", owner);
+        return;
+    }
 
-    for (auto&& pathId : request->GetPathIds()) {
-        auto it = Managers.find(owner);
-        if (it == Managers.end()) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "owner_not_found")("owner", owner);
-            // request->AddError(pathId, "Owner not found");
+    for (auto&& tableId : request->GetPathIds()) {
+        auto dataAccessor = ownerInfo->second.DataAccessors.find(tableId);
+        if (dataAccessor == ownerInfo->second.DataAccessors.end()) {
+            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "data_accessor_not_fount")("owner", owner)("tableId", tableId);
             continue;
         }
 
-        auto iit = it->second.find(pathId);
-        if (iit == it->second.end()) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "table_not_found")("pathId", pathId);
-            // request->AddError(pathId, "Table not found");
-            continue;
-        }
-
-        auto portions = request->StartFetching(pathId);
+        auto portions = request->StartFetching(tableId);
         for (auto&& [portionId, portion] : portions) {
-            auto& ownerRequests = RequestsByPortion[owner];
-            auto requestKey = std::pair{pathId, portionId};
-            auto itRequest = ownerRequests.find(requestKey);
+            auto requestKey = std::pair{tableId, portionId};
+            auto itRequest = ownerInfo->second.RequestsByPortion.find(requestKey);
 
-            if (itRequest == ownerRequests.end()) {
-                ownerRequests[requestKey].push_back(request);
-                PortionsAsk.emplace_back(std::tuple{owner, pathId,
-                    TPortionToAsk{portion, request->GetAbortionFlag(), request->GetConsumer()}});
+            if (itRequest == ownerInfo->second.RequestsByPortion.end()) {
+                ownerInfo->second.RequestsByPortion[requestKey].push_back(request);
+                PortionsAsk.emplace_back(portion, request->GetAbortionFlag(), request->GetConsumer(), owner);
                 Counters.AskNew->Add(1);
             } else {
                 itRequest->second.push_back(request);
@@ -189,31 +153,49 @@ void TLocalManager::DoAskData(const std::shared_ptr<TDataAccessorsRequest>& requ
 }
 
 void TLocalManager::DoRegisterController(std::unique_ptr<IGranuleDataAccessor>&& controller, const bool update, const TActorId& owner) {
-    const auto pathId = controller->GetPathId();
+    auto ownerInfo = PortionOwners.find(owner);
 
     if (update) {
-        auto it = Managers.find(owner);
-        if (it != Managers.end()) {
-            auto iit = it->second.find(pathId);
-            if (iit != it->second.end()) {
-                // Clean up the old controller explicitly
-                iit->second.reset();
-                iit->second = std::move(controller);
-            } else {
-                it->second[pathId] = std::move(controller);
-            }
-        } else {
-            Managers[owner][pathId] = std::move(controller);
-        }
+        AFL_VERIFY(ownerInfo != PortionOwners.end());
+        auto it = ownerInfo->second.DataAccessors.find(controller->GetPathId());
+        AFL_VERIFY(it != ownerInfo->second.DataAccessors.end());
+        it->second = std::move(controller);
     } else {
-        auto& ownerMap = Managers[owner];
-        if (ownerMap.find(pathId) != ownerMap.end()) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "controller_already_exists")("pathId", pathId);
-            return;
+        if (ownerInfo == PortionOwners.end()) {
+            ownerInfo = PortionOwners.emplace(std::pair{owner, std::make_shared<TCallbackWrapper>(AccessorCallback, owner)}).first;
         }
-        ownerMap[pathId] = std::move(controller);
+        ownerInfo->second.DataAccessors[controller->GetPathId()] = std::move(controller);
     }
 
+    ResizeCache();
+}
+
+void TLocalManager::DoUnregisterController(const TInternalPathId tableId, const TActorId& owner) {
+    auto ownerInfo = PortionOwners.find(owner);
+    AFL_VERIFY(ownerInfo != PortionOwners.end());
+    AFL_VERIFY(ownerInfo->second.DataAccessors.erase(tableId));
+    ResizeCache();
+}
+
+ void TLocalManager::DoRemovePortion(const TPortionInfo::TConstPtr& portionInfo, const TActorId& owner) {
+    auto ownerInfo = PortionOwners.find(owner);
+    if (ownerInfo == PortionOwners.end()) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "owner_not_found")("owner", owner);
+        return;
+    }
+    auto it = ownerInfo->second.DataAccessors.find(portionInfo->GetPathId());
+    if (it == ownerInfo->second.DataAccessors.end()) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "data_accessor_not_fount")("owner", owner)("tableId", portionInfo->GetPathId());
+        return;
+    }
+    it->second->ModifyPortions({}, {portionInfo->GetPortionId()});
+}
+
+void TLocalManager::DoClearCache(const TActorId& owner) {
+    if (!PortionOwners.erase(owner)) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "clear_cache_owner_not_found")("owner", owner);
+        return;
+    }
     ResizeCache();
 }
 
@@ -221,44 +203,33 @@ void TLocalManager::DoAddPortion(const TPortionDataAccessor& accessor, const TAc
     const auto pathId = accessor.GetPortionInfo().GetPathId();
     const auto portionId = accessor.GetPortionInfo().GetPortionId();
 
-    auto it = Managers.find(owner);
-    if (it == Managers.end()) {
-        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "owner_not_found_add_portion")("owner", owner);
+    auto ownerInfo = PortionOwners.find(owner);
+    if (ownerInfo == PortionOwners.end()) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "owner_not_found")("owner", owner);
         return;
     }
 
-    auto iit = it->second.find(pathId);
-    if (iit == it->second.end()) {
-        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "table_not_found_add_portion")("pathId", pathId);
+    auto it = ownerInfo->second.DataAccessors.find(pathId);
+    if (it == ownerInfo->second.DataAccessors.end()) {
+        AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "data_accessor_not_fount")("owner", owner)("tableId", pathId);
         return;
     }
 
-    iit->second->ModifyPortions({accessor}, {});
+    it->second->ModifyPortions({accessor}, {});
 
-    auto reqIt = RequestsByPortion.find(owner);
-    if (reqIt != RequestsByPortion.end()) {
-        auto portionKey = std::pair{pathId, portionId};
-        auto iit = reqIt->second.find(portionKey);
 
-        if (iit != reqIt->second.end()) {
-            bool wasInFlight = false;
-            for (auto&& i : iit->second) {
-                if (!i->IsFetched() && !i->IsAborted()) {
-                    i->AddAccessor(accessor);
-                    wasInFlight = true;
-                }
-            }
+    auto portionKey = std::pair{pathId, portionId};
+    auto request = ownerInfo->second.RequestsByPortion.find(portionKey);
 
-            reqIt->second.erase(iit);
-            if (reqIt->second.empty()) {
-                RequestsByPortion.erase(reqIt);
-            }
-
-            if (wasInFlight) {
-                PortionsAskInFlight.Add(-1); // Decrement only if this portion was in flight
+    if (request != ownerInfo->second.RequestsByPortion.end()) {
+        for (auto&& i : request->second) {
+            if (!i->IsFetched() && !i->IsAborted()) {
+                i->AddAccessor(accessor);
             }
         }
+        --PortionsAskInFlight;
     }
+    ownerInfo->second.RequestsByPortion.erase(request);
 
     DrainQueue();
 }

@@ -134,9 +134,17 @@ class TLocalManager: public IDataAccessorsManager {
 private:
     using TBase = IDataAccessorsManager;
     using TPortionId = ui64;
+    class TPortionOwnerInfo {
+    public:
+        THashMap<TInternalPathId, std::shared_ptr<IGranuleDataAccessor>> DataAccessors;
+        THashMap<std::pair<TInternalPathId, TPortionId>, std::vector<std::shared_ptr<TDataAccessorsRequest>>> RequestsByPortion;
+        std::shared_ptr<IAccessorCallback> AccessorCallback;
 
-    THashMap<TActorId, THashMap<TInternalPathId, std::shared_ptr<IGranuleDataAccessor>>> Managers;
-    THashMap<TActorId, THashMap<std::pair<TInternalPathId, TPortionId>, std::vector<std::shared_ptr<TDataAccessorsRequest>>>> RequestsByPortion;
+        TPortionOwnerInfo(std::shared_ptr<IAccessorCallback> accessorCallback): AccessorCallback(accessorCallback) {}
+    };
+
+    THashMap<TActorId, TPortionOwnerInfo> PortionOwners;
+
     TAccessorSignals Counters;
     const std::shared_ptr<Foo> AccessorCallback;
 
@@ -147,25 +155,27 @@ private:
         TPortionInfo::TConstPtr Portion;
         YDB_READONLY_DEF(std::shared_ptr<const TAtomicCounter>, AbortionFlag);
         YDB_READONLY_DEF(TString, ConsumerId);
+        YDB_READONLY_DEF(TActorId, Owner);
 
     public:
         TPortionToAsk(
             const TPortionInfo::TConstPtr& portion,
             const std::shared_ptr<const TAtomicCounter>& abortionFlag,
-            const TString& consumerId)
+            const TString& consumerId,
+            const TActorId& owner)
             : Portion(portion)
             , AbortionFlag(abortionFlag)
-            , ConsumerId(consumerId) {
+            , ConsumerId(consumerId)
+            , Owner(owner) {
         }
 
         TPortionInfo::TConstPtr ExtractPortion() {
             auto result = std::move(Portion);
-            Portion = nullptr; // Prevent use-after-move
             return result;
         }
     };
 
-    std::deque<std::tuple<TActorId, TInternalPathId, TPortionToAsk>> PortionsAsk;
+    std::deque<TPortionToAsk> PortionsAsk;
     TPositiveControlInteger PortionsAskInFlight;
 
     void DrainQueue();
@@ -173,67 +183,34 @@ private:
 
     virtual void DoAskData(const std::shared_ptr<TDataAccessorsRequest>& request, const TActorId& owner);
     virtual void DoRegisterController(std::unique_ptr<IGranuleDataAccessor>&& controller, const bool update, const TActorId& owner);
-
-    virtual void DoUnregisterController(const TInternalPathId pathId, const TActorId& owner) {
-        auto it = Managers.find(owner);
-        if (it == Managers.end()) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "unregister_controller_owner_not_found")("owner", owner)("pathId", pathId);
-            return;
-        }
-
-        if (!it->second.erase(pathId)) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "unregister_controller_path_not_found")("owner", owner)("pathId", pathId);
-            return;
-        }
-
-        ResizeCache();
-    }
-
+    virtual void DoUnregisterController(const TInternalPathId pathId, const TActorId& owner);
     virtual void DoAddPortion(const TPortionDataAccessor& accessor, const TActorId& owner);
+    virtual void DoRemovePortion(const TPortionInfo::TConstPtr& portionInfo, const TActorId& owner);
+    virtual void DoClearCache(const TActorId& owner);
 
-    virtual void DoRemovePortion(const TPortionInfo::TConstPtr& portionInfo, const TActorId& owner) {
-        try {
-            auto manager = getManagerSafe(owner, portionInfo->GetPathId());
-            if (manager) {
-                manager->ModifyPortions({}, { portionInfo->GetPortionId() });
-            }
-        } catch (const std::exception& ex) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "remove_portion_failed")
-                ("owner", owner)("pathId", portionInfo->GetPathId())("error", ex.what());
-        }
-    }
+    // // Safe version that returns nullptr if not found instead of asserting
+    // std::shared_ptr<IGranuleDataAccessor> getManagerSafe(const TActorId& owner, const TInternalPathId& tableId) {
+    //     auto it = Managers.find(owner);
+    //     if (it == Managers.end()) {
+    //         return nullptr;
+    //     }
 
-    virtual void DoClearCache(const TActorId& owner) {
-        if (!Managers.erase(owner)) {
-            AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("event", "clear_cache_owner_not_found")("owner", owner);
-            return;
-        }
-        ResizeCache();
-    }
+    //     auto iit = it->second.find(tableId);
+    //     if (iit == it->second.end()) {
+    //         return nullptr;
+    //     }
 
-    // Safe version that returns nullptr if not found instead of asserting
-    std::shared_ptr<IGranuleDataAccessor> getManagerSafe(const TActorId& owner, const TInternalPathId& tableId) {
-        auto it = Managers.find(owner);
-        if (it == Managers.end()) {
-            return nullptr;
-        }
+    //     return iit->second;
+    // }
 
-        auto iit = it->second.find(tableId);
-        if (iit == it->second.end()) {
-            return nullptr;
-        }
-
-        return iit->second;
-    }
-
-    // Original version with assertions - keep for backward compatibility where asserts are expected
-    std::shared_ptr<IGranuleDataAccessor> getManager(const TActorId& owner, const TInternalPathId& tableId) {
-        auto it = Managers.find(owner);
-        AFL_VERIFY(it != Managers.end());
-        auto iit = it->second.find(tableId);
-        AFL_VERIFY(iit != it->second.end());
-        return iit->second;
-    }
+    // // Original version with assertions - keep for backward compatibility where asserts are expected
+    // std::shared_ptr<IGranuleDataAccessor> getManager(const TActorId& owner, const TInternalPathId& tableId) {
+    //     auto it = Managers.find(owner);
+    //     AFL_VERIFY(it != Managers.end());
+    //     auto iit = it->second.find(tableId);
+    //     AFL_VERIFY(iit != it->second.end());
+    //     return iit->second;
+    // }
 
 public:
     class TTestingCallback: public Foo {
