@@ -177,9 +177,9 @@ private:
 
     std::deque<TPortionToAsk> PortionsAsk;
     TPositiveControlInteger PortionsAskInFlight;
+    std::shared_ptr<TLRUCache<std::tuple<TActorId, TInternalPathId, ui64>, TPortionDataAccessor, TNoopDelete, IGranuleDataAccessor::TMetadataSizeProvider>> MetadataCache;
 
     void DrainQueue();
-    void ResizeCache();
 
     virtual void DoAskData(const std::shared_ptr<TDataAccessorsRequest>& request, const TActorId& owner);
     virtual void DoRegisterController(std::unique_ptr<IGranuleDataAccessor>&& controller, const bool update, const TActorId& owner);
@@ -187,30 +187,6 @@ private:
     virtual void DoAddPortion(const TPortionDataAccessor& accessor, const TActorId& owner);
     virtual void DoRemovePortion(const TPortionInfo::TConstPtr& portionInfo, const TActorId& owner);
     virtual void DoClearCache(const TActorId& owner);
-
-    // // Safe version that returns nullptr if not found instead of asserting
-    // std::shared_ptr<IGranuleDataAccessor> getManagerSafe(const TActorId& owner, const TInternalPathId& tableId) {
-    //     auto it = Managers.find(owner);
-    //     if (it == Managers.end()) {
-    //         return nullptr;
-    //     }
-
-    //     auto iit = it->second.find(tableId);
-    //     if (iit == it->second.end()) {
-    //         return nullptr;
-    //     }
-
-    //     return iit->second;
-    // }
-
-    // // Original version with assertions - keep for backward compatibility where asserts are expected
-    // std::shared_ptr<IGranuleDataAccessor> getManager(const TActorId& owner, const TInternalPathId& tableId) {
-    //     auto it = Managers.find(owner);
-    //     AFL_VERIFY(it != Managers.end());
-    //     auto iit = it->second.find(tableId);
-    //     AFL_VERIFY(iit != it->second.end());
-    //     return iit->second;
-    // }
 
 public:
     class TTestingCallback: public Foo {
@@ -260,6 +236,7 @@ public:
         if (HasAppData()) {
             TotalMemorySize = AppDataVerified().ColumnShardConfig.GetWritingInFlightRequestsCountLimit();
         }
+        MetadataCache = std::make_shared<TLRUCache<std::tuple<TActorId, TInternalPathId, ui64>, TPortionDataAccessor, TNoopDelete, IGranuleDataAccessor::TMetadataSizeProvider>>(TotalMemorySize);
     }
 };
 

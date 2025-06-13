@@ -1,5 +1,7 @@
 #include "manager.h"
 
+#include <algorithm>
+
 #include <ydb/core/tx/columnshard/hooks/abstract/abstract.h>
 
 #include <ydb/library/accessor/positive_integer.h>
@@ -70,9 +72,8 @@ void TLocalManager::DrainQueue() {
                 auto dataAnalyzed = dataAccessor->second->AnalyzeData(portions);
 
                 for (auto&& accessor : dataAnalyzed.GetCachedAccessors()) {
-                    auto it = ownerInfo->second.RequestsByPortion.find(std::pair{tableId, accessor.GetPortionInfo().GetPortionId()});
+                    auto it = ownerInfo->second.RequestsByPortion.find(std::pair{accessor.GetPortionInfo().GetPathId(), accessor.GetPortionInfo().GetPortionId()});
                     AFL_VERIFY(it != ownerInfo->second.RequestsByPortion.end());
-
                     for (auto&& i : it->second) {
                         Counters.ResultFromCache->Add(1);
                         if (!i->IsFetched() && !i->IsAborted()) {
@@ -97,26 +98,6 @@ void TLocalManager::DrainQueue() {
     PortionsAskInFlight.Add(countToFlight);
     Counters.FetchingCount->Set(PortionsAskInFlight);
     Counters.QueueSize->Set(PortionsAsk.size());
-}
-
-void TLocalManager::ResizeCache() {
-    auto amount = 0;
-    for (auto& [_, ownerInfo] : PortionOwners) {
-        amount += ownerInfo.DataAccessors.size();
-    }
-
-    if (amount <= 0) {
-        return;
-    }
-
-    auto size = TotalMemorySize / amount;
-    for (auto& [_, ownerInfo] : PortionOwners) {
-        for (auto& [__, dataAccessor] : ownerInfo.DataAccessors) {
-            if (dataAccessor) {
-                dataAccessor->Resize(size);
-            }
-        }
-    }
 }
 
 void TLocalManager::DoAskData(const std::shared_ptr<TDataAccessorsRequest>& request, const TActorId& owner) {
@@ -159,22 +140,24 @@ void TLocalManager::DoRegisterController(std::unique_ptr<IGranuleDataAccessor>&&
         AFL_VERIFY(ownerInfo != PortionOwners.end());
         auto it = ownerInfo->second.DataAccessors.find(controller->GetPathId());
         AFL_VERIFY(it != ownerInfo->second.DataAccessors.end());
-        it->second = std::move(controller);
+        controller->SetCache(MetadataCache);
+        controller->SetOwner(owner);
+        ownerInfo->second.DataAccessors[controller->GetPathId()] = std::move(controller);
     } else {
         if (ownerInfo == PortionOwners.end()) {
             ownerInfo = PortionOwners.emplace(std::pair{owner, std::make_shared<TCallbackWrapper>(AccessorCallback, owner)}).first;
         }
+        controller->SetCache(MetadataCache);
+        controller->SetOwner(owner);
         ownerInfo->second.DataAccessors[controller->GetPathId()] = std::move(controller);
     }
 
-    ResizeCache();
 }
 
 void TLocalManager::DoUnregisterController(const TInternalPathId tableId, const TActorId& owner) {
     auto ownerInfo = PortionOwners.find(owner);
     AFL_VERIFY(ownerInfo != PortionOwners.end());
     AFL_VERIFY(ownerInfo->second.DataAccessors.erase(tableId));
-    ResizeCache();
 }
 
  void TLocalManager::DoRemovePortion(const TPortionInfo::TConstPtr& portionInfo, const TActorId& owner) {
@@ -192,11 +175,19 @@ void TLocalManager::DoUnregisterController(const TInternalPathId tableId, const 
 }
 
 void TLocalManager::DoClearCache(const TActorId& owner) {
+    for (auto it = MetadataCache->Begin(); it != MetadataCache->End(); ) {
+        if (std::get<0>(it.Key()) == owner) {
+            auto current = it;
+            ++it;
+            MetadataCache->Erase(current);
+        }
+        else {
+            ++it;
+        }
+    }
     if (!PortionOwners.erase(owner)) {
         AFL_WARN(NKikimrServices::TX_COLUMNSHARD)("shared_metadata_cache", "clear_cache_owner_not_found")("owner", owner);
-        return;
     }
-    ResizeCache();
 }
 
 void TLocalManager::DoAddPortion(const TPortionDataAccessor& accessor, const TActorId& owner) {
