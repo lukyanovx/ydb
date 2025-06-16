@@ -12,11 +12,13 @@ from ydb.tests.oss.ydb_sdk_import import ydb
 
 def string_version_to_tuple(s):
     result = []
-    for elem in s.split("-"):
+    s = s.replace('.', '-')
+    for idx, elem in enumerate(s.split("-")):
         try:
             result.append(int(elem))
         except ValueError:
-            result.append(float("NaN"))
+            if idx > 0:
+                result.append(float("NaN"))
     return tuple(result)
 
 
