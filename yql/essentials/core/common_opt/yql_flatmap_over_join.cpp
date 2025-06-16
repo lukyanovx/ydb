@@ -418,7 +418,7 @@ TExprNode::TPtr RemoveJoinKeysFromElimination(const TExprNode& settings, TExprCo
 }
 
 TExprNode::TPtr FilterPushdownOverJoinOptionalSide(TExprNode::TPtr equiJoin, TExprNode::TPtr predicate,
-    const TSet<TStringBuf>& usedFields, TExprNode::TPtr args, const TJoinLabels& labels,
+    TExprNode::TPtr args, const TJoinLabels& labels,
     ui32 inputIndex, const TMap<TStringBuf, TVector<TStringBuf>>& renameMap, bool ordered, bool skipNulls, TExprContext& ctx,
     const TPositionHandle& pos)
 {
@@ -443,19 +443,6 @@ TExprNode::TPtr FilterPushdownOverJoinOptionalSide(TExprNode::TPtr equiJoin, TEx
     TMap<TString, TSet<TString>> aliases;
     GatherKeyAliases(joinTree, aliases, labels);
     MakeTransitiveClosure(aliases);
-
-    // check whether some used fields are not aliased
-    bool onlyKeys = true;
-    for (auto& x : usedFields) {
-        if (!aliases.contains(TString(x))) {
-            onlyKeys = false;
-            break;
-        }
-    }
-
-    if (onlyKeys) {
-        return equiJoin;
-    }
 
     THashMap<TString, TExprNode::TPtr> equiJoinLabels;
     // Stores labels as hash set and associated join input.
@@ -512,7 +499,7 @@ TExprNode::TPtr FilterPushdownOverJoinOptionalSide(TExprNode::TPtr equiJoin, TEx
 
     // then apply predicate
     auto filteredInput = ApplyJoinPredicate(
-        predicate, /*filterInput=*/rightSideInput, args, labels, {}, renameMap, onlyKeys,
+        predicate, /*filterInput=*/rightSideInput, args, labels, {}, renameMap, /*onlyKeys=*/false,
         inputIndex, inputIndex, ordered, /*substituteWithNulls=*/false, /*forceOptional=*/true, ctx
     );
 
@@ -584,7 +571,7 @@ TExprNode::TPtr FilterPushdownOverJoinOptionalSide(TExprNode::TPtr equiJoin, TEx
 
     //extend left only join with nulls as left part and apply same predicate
     auto nullPredicateFilter = ApplyJoinPredicate(
-        predicate, /*filterInput=*/leftOnlyJoin, args, labels, {}, renameMap, onlyKeys,
+        predicate, /*filterInput=*/leftOnlyJoin, args, labels, {}, renameMap, /*onlyKeys=*/false,
         inputIndex, inputIndex, ordered, /*substituteWithNulls=*/true, /*forceOptional=*/false, ctx
     );
 
@@ -1547,7 +1534,7 @@ TExprBase FlatMapOverEquiJoin(
                     extraPredicate = FuseAndTerms(node.Pos(), andTerms, andTerm, isPg, ctx);
                     break;
                 } else if (types->FilterPushdownOverJoinOptionalSide) {
-                    auto twoJoins = FilterPushdownOverJoinOptionalSide(equiJoin.Ptr(), andTerm, usedFields,
+                    auto twoJoins = FilterPushdownOverJoinOptionalSide(equiJoin.Ptr(), andTerm,
                         node.Lambda().Args().Ptr(), labels, *inputs.begin(), renameMap, ordered, skipNulls, ctx, node.Pos());
                     if (twoJoins != equiJoin.Ptr()) {
                         YQL_CLOG(DEBUG, Core) << "RightSidePredicatePushdownOverLeftJoin";
